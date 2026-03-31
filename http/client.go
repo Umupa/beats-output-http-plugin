@@ -25,6 +25,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
@@ -45,6 +46,9 @@ type Client struct {
 	compressionLevel int
 	proxyURL         *url.URL
 	batchPublish     bool
+	pathPrefix       string
+	pathField        string
+	pathSuffix       string
 	observer         outputs.Observer
 	headers          map[string]string
 	format           string
@@ -53,6 +57,9 @@ type Client struct {
 // ClientSettings struct
 type ClientSettings struct {
 	URL                string
+	PathPrefix         string
+	PathField          string
+	PathSuffix         string
 	Proxy              *url.URL
 	TLS                *tlscommon.TLSConfig
 	Username, Password string
@@ -100,8 +107,8 @@ func NewClient(s ClientSettings) (*Client, error) {
 	tlsDialer, err = transport.TLSDialer(dialer, s.TLS, s.Timeout)
 
 	if err != nil {
-        return nil, err
-    }
+		return nil, err
+	}
 
 	if st := s.Observer; st != nil {
 		dialer = transport.StatsDialer(dialer, st)
@@ -148,6 +155,9 @@ func NewClient(s ClientSettings) (*Client, error) {
 		compressionLevel: compression,
 		proxyURL:         s.Proxy,
 		batchPublish:     s.BatchPublish,
+		pathPrefix:       s.PathPrefix,
+		pathField:        s.PathField,
+		pathSuffix:       s.PathSuffix,
 		headers:          s.Headers,
 		format:           s.Format,
 	}
@@ -164,6 +174,9 @@ func (client *Client) Clone() *Client {
 	c, _ := NewClient(
 		ClientSettings{
 			URL:              client.URL,
+			PathPrefix:       client.pathPrefix,
+			PathField:        client.pathField,
+			PathSuffix:       client.pathSuffix,
 			Proxy:            client.proxyURL,
 			TLS:              client.tlsConfig,
 			Username:         client.Username,
@@ -250,24 +263,31 @@ func (client *Client) BatchPublishEvent(data []publisher.Event) error {
 	if !client.connected {
 		return ErrNotConnected
 	}
-	events := make([]eventRaw, len(data))
-	for i, event := range data {
-		events[i] = makeEvent(&event.Content)
-	}
-	status, _, err := client.request("POST", client.params, events, client.headers)
+	urlGroups, err := client.groupEventsByURL(data)
 	if err != nil {
-		logger.Warn("Fail to insert a single event: %s", err)
-		if err == ErrJSONEncodeFailed {
-			// don't retry unencodable values
-			return nil
-		}
-	}
-	switch {
-	case status == 500 || status == 400: // server error or bad input, don't retry
-		return nil
-	case status >= 300:
-		// retry
 		return err
+	}
+
+	for _, group := range urlGroups {
+		events := make([]eventRaw, len(group.events))
+		for i, event := range group.events {
+			events[i] = client.makeEvent(&event.Content)
+		}
+		status, _, err := client.requestURL("POST", group.url, client.params, events, client.headers)
+		if err != nil {
+			logger.Warn("Fail to insert a single event: %s", err)
+			if err == ErrJSONEncodeFailed {
+				// don't retry unencodable values
+				return nil
+			}
+		}
+		switch {
+		case status == 500 || status == 400: // server error or bad input, don't retry
+			continue
+		case status >= 300:
+			// retry
+			return err
+		}
 	}
 	return nil
 }
@@ -279,7 +299,11 @@ func (client *Client) PublishEvent(data publisher.Event) error {
 	}
 	event := data
 	logger.Debugf("Publish event: %s", event)
-	status, _, err := client.request("POST", client.params, makeEvent(&event.Content), client.headers)
+	requestURL, err := client.resolveRequestURL(event)
+	if err != nil {
+		return err
+	}
+	status, _, err := client.requestURL("POST", requestURL, client.params, client.makeEvent(&event.Content), client.headers)
 	if err != nil {
 		logger.Warn("Fail to insert a single event: %s", err)
 		if err == ErrJSONEncodeFailed {
@@ -301,7 +325,11 @@ func (client *Client) PublishEvent(data publisher.Event) error {
 }
 
 func (conn *Connection) request(method string, params map[string]string, body interface{}, headers map[string]string) (int, []byte, error) {
-	urlStr := addToURL(conn.URL, params)
+	return conn.requestURL(method, conn.URL, params, body, headers)
+}
+
+func (conn *Connection) requestURL(method, requestURL string, params map[string]string, body interface{}, headers map[string]string) (int, []byte, error) {
+	urlStr := addToURL(requestURL, params)
 	logger.Debugf("%s %s %v", method, urlStr, body)
 
 	if body == nil {
@@ -313,6 +341,94 @@ func (conn *Connection) request(method string, params map[string]string, body in
 		return 0, nil, ErrJSONEncodeFailed
 	}
 	return conn.execRequest(method, urlStr, conn.encoder.Reader(), headers)
+}
+
+type urlEventGroup struct {
+	url    string
+	events []publisher.Event
+}
+
+func (client *Client) groupEventsByURL(data []publisher.Event) ([]urlEventGroup, error) {
+	groups := make(map[string][]publisher.Event)
+	order := make([]string, 0)
+	for _, event := range data {
+		requestURL, err := client.resolveRequestURL(event)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := groups[requestURL]; !exists {
+			order = append(order, requestURL)
+		}
+		groups[requestURL] = append(groups[requestURL], event)
+	}
+
+	result := make([]urlEventGroup, 0, len(order))
+	for _, requestURL := range order {
+		result = append(result, urlEventGroup{
+			url:    requestURL,
+			events: groups[requestURL],
+		})
+	}
+	return result, nil
+}
+
+func (client *Client) resolveRequestURL(event publisher.Event) (string, error) {
+	if client.pathPrefix == "" || client.pathField == "" {
+		return client.URL, nil
+	}
+
+	value, err := event.Content.Fields.GetValue(client.pathField)
+	if err != nil {
+		return client.staticOrError()
+	}
+
+	stream, ok := value.(string)
+	if !ok || strings.TrimSpace(stream) == "" {
+		return client.staticOrError()
+	}
+
+	parsedURL, err := url.Parse(client.URL)
+	if err != nil {
+		return "", err
+	}
+	parsedURL.Path = joinURLPath(client.pathPrefix, stream) + client.pathSuffix
+	parsedURL.RawPath = ""
+	return parsedURL.String(), nil
+}
+
+func (client *Client) staticOrError() (string, error) {
+	parsedURL, err := url.Parse(client.URL)
+	if err != nil {
+		return "", err
+	}
+	if parsedURL.Path != "" && parsedURL.Path != "/" {
+		return client.URL, nil
+	}
+	return "", fmt.Errorf("missing dynamic path field %q and no static path fallback configured", client.pathField)
+}
+
+func joinURLPath(parts ...string) string {
+	joined := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.Trim(part, "/")
+		if trimmed == "" {
+			continue
+		}
+		joined = append(joined, trimmed)
+	}
+	if len(joined) == 0 {
+		return "/"
+	}
+	return "/" + strings.Join(joined, "/")
+}
+
+func (client *Client) makeEvent(v *beat.Event) eventRaw {
+	if client.pathPrefix == "" || client.pathField == "" {
+		return makeEvent(v)
+	}
+	return makeEventWithoutFields(v, map[string]struct{}{
+		client.pathField: {},
+	})
 }
 
 func (conn *Connection) execRequest(method, url string, body io.Reader, headers map[string]string) (int, []byte, error) {
@@ -364,6 +480,10 @@ func closing(c io.Closer) {
 
 // this should ideally be in enc.go
 func makeEvent(v *beat.Event) map[string]json.RawMessage {
+	return makeEventWithoutFields(v, nil)
+}
+
+func makeEventWithoutFields(v *beat.Event, excludedFields map[string]struct{}) map[string]json.RawMessage {
 	// Inline not supported,
 	// HT: https://stackoverflow.com/questions/49901287/embed-mapstringstring-in-go-json-marshaling-without-extra-json-property-inlin
 	type event0 event // prevent recursion
@@ -380,6 +500,9 @@ func makeEvent(v *beat.Event) map[string]json.RawMessage {
 	}
 	// Add the individual fields to the map, flatten "Fields"
 	for j, k := range e.Fields {
+		if _, excluded := excludedFields[j]; excluded {
+			continue
+		}
 		b, err = json.Marshal(k)
 		if err != nil {
 			logger.Warn("Error encoding map to JSON: %v", err)

@@ -27,6 +27,9 @@ import (
 type httpConfig struct {
 	Protocol         string            `config:"protocol"`
 	Path             string            `config:"path"`
+	PathPrefix       string            `config:"path_prefix"`
+	PathField        string            `config:"path_field"`
+	PathSuffix       string            `config:"path_suffix"`
 	Params           map[string]string `config:"parameters"`
 	Username         string            `config:"username"`
 	Password         string            `config:"password"`
@@ -52,6 +55,9 @@ type backoff struct {
 var defaultConfig = httpConfig{
 	Protocol:         "",
 	Path:             "",
+	PathPrefix:       "",
+	PathField:        "",
+	PathSuffix:       "",
 	Params:           nil,
 	ProxyURL:         "",
 	Username:         "",
@@ -71,6 +77,9 @@ var defaultConfig = httpConfig{
 }
 
 func (c *httpConfig) Validate() error {
+	if (c.PathPrefix == "") != (c.PathField == "") {
+		return fmt.Errorf("path_prefix and path_field must be configured together")
+	}
 	if c.ProxyURL != "" {
 		if _, err := parseProxyURL(c.ProxyURL); err != nil {
 			return err

@@ -80,6 +80,9 @@ func MakeHTTP(
 		var client outputs.NetworkClient
 		client, err = NewClient(ClientSettings{
 			URL:              hostURL,
+			PathPrefix:       config.PathPrefix,
+			PathField:        config.PathField,
+			PathSuffix:       config.PathSuffix,
 			Proxy:            proxyURL,
 			TLS:              tlsConfig,
 			Username:         config.Username,
